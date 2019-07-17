@@ -2,7 +2,7 @@
   +----------------------------------------------------------------------+
   | PHP Version 7                                                        |
   +----------------------------------------------------------------------+
-  | Copyright (c) 2006-2018 The PHP Group                                |
+  | Copyright (c) The PHP Group                                          |
   +----------------------------------------------------------------------+
   | This source file is subject to version 3.01 of the PHP license,      |
   | that is bundled with this package in the file LICENSE, and is        |
@@ -79,14 +79,12 @@ MYSQLND_METHOD(mysqlnd_vio, network_read)(MYSQLND_VIO * const vio, zend_uchar * 
 {
 	enum_func_status return_value = PASS;
 	php_stream * net_stream = vio->data->m.get_stream(vio);
-	size_t old_chunk_size = net_stream->chunk_size;
 	size_t to_read = count, ret;
 	zend_uchar * p = buffer;
 
 	DBG_ENTER("mysqlnd_vio::network_read");
 	DBG_INF_FMT("count="MYSQLND_SZ_T_SPEC, count);
 
-	net_stream->chunk_size = MIN(to_read, vio->data->options.net_read_buffer_size);
 	while (to_read) {
 		if (!(ret = php_stream_read(net_stream, (char *) p, to_read))) {
 			DBG_ERR_FMT("Error while reading header from socket");
@@ -97,7 +95,6 @@ MYSQLND_METHOD(mysqlnd_vio, network_read)(MYSQLND_VIO * const vio, zend_uchar * 
 		to_read -= ret;
 	}
 	MYSQLND_INC_CONN_STATISTIC_W_VALUE(stats, STAT_BYTES_RECEIVED, count - to_read);
-	net_stream->chunk_size = old_chunk_size;
 	DBG_RETURN(return_value);
 }
 /* }}} */
@@ -196,7 +193,7 @@ MYSQLND_METHOD(mysqlnd_vio, open_tcp_or_unix)(MYSQLND_VIO * const vio, const MYS
 						 UNKNOWN_SQLSTATE,
 						 errstr? ZSTR_VAL(errstr):"Unknown error while connecting");
 		if (errstr) {
-			zend_string_release(errstr);
+			zend_string_release_ex(errstr, 0);
 		}
 		DBG_RETURN(NULL);
 	}
@@ -265,6 +262,8 @@ MYSQLND_METHOD(mysqlnd_vio, post_connect_set_opt)(MYSQLND_VIO * const vio, const
 			/* TCP -> Set SO_KEEPALIVE */
 			mysqlnd_set_sock_keepalive(net_stream);
 		}
+
+		net_stream->chunk_size = vio->data->options.net_read_buffer_size;
 	}
 
 	DBG_VOID_RETURN;
@@ -645,18 +644,17 @@ MYSQLND_METHOD(mysqlnd_vio, close_stream)(MYSQLND_VIO * const net, MYSQLND_STATS
 	if (net && (net_stream = net->data->m.get_stream(net))) {
 		zend_bool pers = net->persistent;
 		DBG_INF_FMT("Freeing stream. abstract=%p", net_stream->abstract);
-		if (pers) {
-			if (EG(active)) {
-				php_stream_free(net_stream, PHP_STREAM_FREE_CLOSE_PERSISTENT | PHP_STREAM_FREE_RSRC_DTOR);
-			} else {
-				/*
-				  otherwise we will crash because the EG(persistent_list) has been freed already,
-				  before the modules are shut down
-				*/
-				php_stream_free(net_stream, PHP_STREAM_FREE_CLOSE | PHP_STREAM_FREE_RSRC_DTOR);
-			}
+		/* We removed the resource from the stream, so pass FREE_RSRC_DTOR now to force
+		 * destruction to occur during shutdown, because it won't happen through the resource. */
+		/* TODO: The EG(active) check here is dead -- check IN_SHUTDOWN? */
+		if (pers && EG(active)) {
+			php_stream_free(net_stream, PHP_STREAM_FREE_CLOSE_PERSISTENT | PHP_STREAM_FREE_RSRC_DTOR);
 		} else {
-			php_stream_free(net_stream, PHP_STREAM_FREE_CLOSE);
+			/*
+			  otherwise we will crash because the EG(persistent_list) has been freed already,
+			  before the modules are shut down
+			*/
+			php_stream_free(net_stream, PHP_STREAM_FREE_CLOSE | PHP_STREAM_FREE_RSRC_DTOR);
 		}
 		net->data->m.set_stream(net, NULL);
 	}
@@ -790,13 +788,3 @@ mysqlnd_vio_free(MYSQLND_VIO * const vio, MYSQLND_STATS * stats, MYSQLND_ERROR_I
 	DBG_VOID_RETURN;
 }
 /* }}} */
-
-
-/*
- * Local variables:
- * tab-width: 4
- * c-basic-offset: 4
- * End:
- * vim600: noet sw=4 ts=4 fdm=marker
- * vim<600: noet sw=4 ts=4
- */

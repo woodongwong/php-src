@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | PHP Version 7                                                        |
    +----------------------------------------------------------------------+
-   | Copyright (c) 1997-2018 The PHP Group                                |
+   | Copyright (c) The PHP Group                                          |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,8 +18,6 @@
    |          Jim Winstead <jimw@php.net>                                 |
    +----------------------------------------------------------------------+
  */
-
-/* $Id$ */
 
 #define _GNU_SOURCE
 #include "php.h"
@@ -93,7 +91,11 @@ fprintf(stderr, "forget_persistent: %s:%p\n", stream->ops->label, stream);
 
 PHP_RSHUTDOWN_FUNCTION(streams)
 {
-	zend_hash_apply(&EG(persistent_list), forget_persistent_resource_id_numbers);
+	zval *el;
+
+	ZEND_HASH_FOREACH_VAL(&EG(persistent_list), el) {
+		forget_persistent_resource_id_numbers(el);
+	} ZEND_HASH_FOREACH_END();
 	return SUCCESS;
 }
 
@@ -359,14 +361,21 @@ PHPAPI int _php_stream_free(php_stream *stream, int close_options) /* {{{ */
 	int ret = 1;
 	int preserve_handle = close_options & PHP_STREAM_FREE_PRESERVE_HANDLE ? 1 : 0;
 	int release_cast = 1;
-	php_stream_context *context = NULL;
+	php_stream_context *context;
 
-	/* on an resource list destruction, the context, another resource, may have
-	 * already been freed (if it was created after the stream resource), so
-	 * don't reference it */
-	if (EG(active)) {
-		context = PHP_STREAM_CONTEXT(stream);
+	/* During shutdown resources may be released before other resources still holding them.
+	 * When only resoruces are referenced this is not a problem, because they are refcounted
+	 * and will only be fully freed once the refcount drops to zero. However, if php_stream*
+	 * is held directly, we don't have this guarantee. To avoid use-after-free we ignore all
+	 * stream free operations in shutdown unless they come from the resource list destruction,
+	 * or by freeing an enclosed stream (in which case resource list destruction will not have
+	 * freed it). */
+	if ((EG(flags) & EG_FLAGS_IN_SHUTDOWN) &&
+			!(close_options & (PHP_STREAM_FREE_RSRC_DTOR|PHP_STREAM_FREE_IGNORE_ENCLOSING))) {
+		return 1;
 	}
+
+	context = PHP_STREAM_CONTEXT(stream);
 
 	if (stream->flags & PHP_STREAM_FLAG_NO_CLOSE) {
 		preserve_handle = 1;
@@ -584,7 +593,9 @@ PHPAPI void _php_stream_fill_read_buffer(php_stream *stream, size_t size)
 							stream->readbuf = perealloc(stream->readbuf, stream->readbuflen,
 									stream->is_persistent);
 						}
-						memcpy(stream->readbuf + stream->writepos, bucket->buf, bucket->buflen);
+						if (bucket->buflen) {
+							memcpy(stream->readbuf + stream->writepos, bucket->buf, bucket->buflen);
+						}
 						stream->writepos += bucket->buflen;
 
 						php_stream_bucket_unlink(bucket);
@@ -624,7 +635,9 @@ PHPAPI void _php_stream_fill_read_buffer(php_stream *stream, size_t size)
 
 			/* reduce buffer memory consumption if possible, to avoid a realloc */
 			if (stream->readbuf && stream->readbuflen - stream->writepos < stream->chunk_size) {
-				memmove(stream->readbuf, stream->readbuf + stream->readpos, stream->readbuflen - stream->readpos);
+				if (stream->writepos > stream->readpos) {
+					memmove(stream->readbuf, stream->readbuf + stream->readpos, stream->writepos - stream->readpos);
+				}
 				stream->writepos -= stream->readpos;
 				stream->readpos = 0;
 			}
@@ -1677,7 +1690,7 @@ PHPAPI int php_register_url_stream_wrapper(const char *protocol, const php_strea
 
 	str = zend_string_init_interned(protocol, protocol_len, 1);
 	ret = zend_hash_add_ptr(&url_stream_wrappers_hash, str, (void*)wrapper) ? SUCCESS : FAILURE;
-	zend_string_release(str);
+	zend_string_release_ex(str, 1);
 	return ret;
 }
 
@@ -1884,6 +1897,8 @@ PHPAPI int _php_stream_stat_path(const char *path, int flags, php_stream_statbuf
 	const char *path_to_open = path;
 	int ret;
 
+	memset(ssb, 0, sizeof(*ssb));
+
 	if (!(flags & PHP_STREAM_URL_STAT_NOCACHE)) {
 		/* Try to hit the cache first */
 		if (flags & PHP_STREAM_URL_STAT_LINK) {
@@ -2011,7 +2026,7 @@ PHPAPI php_stream *_php_stream_open_wrapper_ex(const char *path, const char *mod
 	if (options & STREAM_USE_URL && (!wrapper || !wrapper->is_url)) {
 		php_error_docref(NULL, E_WARNING, "This function may only be used against URLs");
 		if (resolved_path) {
-			zend_string_release(resolved_path);
+			zend_string_release_ex(resolved_path, 0);
 		}
 		return NULL;
 	}
@@ -2064,7 +2079,7 @@ PHPAPI php_stream *_php_stream_open_wrapper_ex(const char *path, const char *mod
 						? PHP_STREAM_PREFER_STDIO : PHP_STREAM_NO_PREFERENCE)) {
 			case PHP_STREAM_UNCHANGED:
 				if (resolved_path) {
-					zend_string_release(resolved_path);
+					zend_string_release_ex(resolved_path, 0);
 				}
 				return stream;
 			case PHP_STREAM_RELEASED:
@@ -2073,7 +2088,7 @@ PHPAPI php_stream *_php_stream_open_wrapper_ex(const char *path, const char *mod
 				}
 				newstream->orig_path = pestrdup(path, persistent);
 				if (resolved_path) {
-					zend_string_release(resolved_path);
+					zend_string_release_ex(resolved_path, 0);
 				}
 				return newstream;
 			default:
@@ -2103,7 +2118,7 @@ PHPAPI php_stream *_php_stream_open_wrapper_ex(const char *path, const char *mod
 	if (stream == NULL && (options & REPORT_ERRORS)) {
 		php_stream_display_wrapper_errors(wrapper, path, "failed to open stream");
 		if (opened_path && *opened_path) {
-			zend_string_release(*opened_path);
+			zend_string_release_ex(*opened_path, 0);
 			*opened_path = NULL;
 		}
 	}
@@ -2114,7 +2129,7 @@ PHPAPI php_stream *_php_stream_open_wrapper_ex(const char *path, const char *mod
 	}
 #endif
 	if (resolved_path) {
-		zend_string_release(resolved_path);
+		zend_string_release_ex(resolved_path, 0);
 	}
 	return stream;
 }
@@ -2205,14 +2220,12 @@ PHPAPI int php_stream_context_set_option(php_stream_context *context,
 	if (NULL == wrapperhash) {
 		array_init(&category);
 		wrapperhash = zend_hash_str_update(Z_ARRVAL(context->options), (char*)wrappername, strlen(wrappername), &category);
-		if (NULL == wrapperhash) {
-			return FAILURE;
-		}
 	}
 	ZVAL_DEREF(optionvalue);
 	Z_TRY_ADDREF_P(optionvalue);
 	SEPARATE_ARRAY(wrapperhash);
-	return zend_hash_str_update(Z_ARRVAL_P(wrapperhash), optionname, strlen(optionname), optionvalue) ? SUCCESS : FAILURE;
+	zend_hash_str_update(Z_ARRVAL_P(wrapperhash), optionname, strlen(optionname), optionvalue);
+	return SUCCESS;
 }
 /* }}} */
 
@@ -2288,12 +2301,3 @@ PHPAPI int _php_stream_scandir(const char *dirname, zend_string **namelist[], in
 	return nfiles;
 }
 /* }}} */
-
-/*
- * Local variables:
- * tab-width: 4
- * c-basic-offset: 4
- * End:
- * vim600: noet sw=4 ts=4 fdm=marker
- * vim<600: noet sw=4 ts=4
- */
