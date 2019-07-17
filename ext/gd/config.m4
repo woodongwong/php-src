@@ -186,14 +186,18 @@ AC_DEFUN([PHP_GD_FREETYPE2],[
 
     for i in $PHP_FREETYPE_DIR /usr/local /usr; do
       if test -f "$i/bin/freetype-config"; then
-        FREETYPE2_DIR=$i
         FREETYPE2_CONFIG="$i/bin/freetype-config"
         break
       fi
     done
 
-    if test -z "$FREETYPE2_DIR"; then
-      AC_MSG_ERROR([freetype-config not found.])
+    if test -z "$FREETYPE2_CONFIG"; then
+      AC_PATH_PROG(PKG_CONFIG, pkg-config, no)
+      if test -x "$PKG_CONFIG" && $PKG_CONFIG --exists freetype2; then
+        FREETYPE2_CONFIG="$PKG_CONFIG freetype2"
+      else
+        AC_MSG_ERROR([freetype-config not found.])
+      fi
     fi
 
     FREETYPE2_CFLAGS=`$FREETYPE2_CONFIG --cflags`
@@ -318,7 +322,7 @@ dnl enable the support in bundled GD library
     GDLIB_CFLAGS="$GDLIB_CFLAGS -DHAVE_XPM"
   fi
 
-  if test -n "$FREETYPE2_DIR"; then
+  if test -n "$FREETYPE2_CONFIG"; then
     AC_DEFINE(HAVE_GD_FREETYPE,   1, [ ])
     AC_DEFINE(ENABLE_GD_TTF, 1, [ ])
     GDLIB_CFLAGS="$GDLIB_CFLAGS -DHAVE_LIBFREETYPE -DENABLE_GD_TTF"
